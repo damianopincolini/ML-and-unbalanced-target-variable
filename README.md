@@ -14,3 +14,6 @@ I will run explorative data analysis only on training set, so to avoid any data 
 During preprocessing, I will "re-balance" the target variable distribution via both undersampling and oversampling using different ratio between the two target classes and I will train a decision tree model (so to rank variable importance).
 
 Finally, I will check what solution will produce the best result.
+
+
+This repository contains the orginal dataset (.csv), the quarto file containing the code chuncks and the final report in .pdf format. 
