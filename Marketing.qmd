@@ -1,0 +1,924 @@
+---
+title: "Undersampling vs oversampling in a ML project with umbalanced target variable"
+author: "Damiano Pincolini"
+format: pdf
+date: 2024/07/10
+editor: visual
+toc: TRUE
+---
+
+# 1. Preface
+
+## 1.1. Project goal
+
+This project aims to define a machine learning model able to solve a classification problem. Starting from a dataset containing features about a direct marketing campaigns (phone calls) of a Portuguese bank (see below for references), the goal is to predict if the client will subscribe a term deposit.
+
+My specific interest will not be to find the best model based on a specific performance metric; instead, given a model, I want to tune its parameters in a proper way and, above all, handling the unbalanced distribution of the binary target variable ("yes", "no").
+
+My attempt will be to proper evaluate how to fix the unbalanced distribution and, specifically, what between an undersampling or an oversampling strategy will fit the bill better.
+
+I will download the dataset, wrangle it (for what necessary) and split into training and test set.
+
+I will run explorative data analysis only on training set, so to avoid any data leakage and will take into account the results of this analysis to set a proprer pre-processing recipe.
+
+During preprocessing, I will "re-balance" the target variable distribution via both undersampling and oversampling using different ratio between the two target classes and I will train a decision tree model (so to rank variable importance).
+
+Finally, I will check what solution will produce the best result.
+
+## 1.2. Loading packages
+
+The packages I am going to use are tidyverse for manipulation and visualization, smartEDA for explorative analysis, tidymodels for modeling and some others in the command below.
+
+```{r}
+pacman::p_load(tidyverse,
+               SmartEDA,
+               DescTools,
+               factoextra,
+               ggcorrplot,
+               corrplot,
+               tidymodels,
+               themis,
+               rpart.plot,
+               vip,
+               shapviz,
+               knitr)
+```
+
+## 1.3. Loading data
+
+The csv file contaning the dataset can be downladed at the <https://archive.ics.uci.edu/dataset/222/bank+marketing> page of the UC Irvine Machine Learning Repository.
+
+I've named it "DataBank.csv" and saved in my desktop and then in R global environment as "DataOrigin". This file is available in this github page.
+
+```{r}
+#| output: false
+DataOrigin <- read_csv2("DataBank.csv") 
+```
+
+## 1.4. Dataset content
+
+Let's start with a first glance at DataOrigin structure and datatype.
+
+```{r}
+ExpData(DataOrigin, type=1)
+```
+
+The dataset has a 45211 rows and 17 columns (amongst which there's the target variable y).
+
+There are 7 numeric and 10 categorical features and no missing case.
+
+```{r}
+ExpData(DataOrigin, type=2)
+
+```
+
+```{r}
+str(DataOrigin)
+```
+
+The dataset is composed of the following columns:
+
+1.  age
+
+2.  job: type of job (categorical: 'admin.','blue-collar','entrepreneur','housemaid', 'management','retired','self-employed','services','student','technician','unemployed', 'unknown')
+
+3.  marital: marital status (categorical: 'divorced','married','single','unknown'; note: 'divorced' means divorced or widowed)
+
+4.  education: (categorical: 'basic.4y','basic.6y','basic.9y','high.school','illiterate', 'professional.course','university.degree','unknown')
+
+5.  default: has credit in default?
+
+6.  balance: average yearly balance
+
+7.  housing: has housing loan?
+
+8.  loan: has personal loan?
+
+9.  contact: contact communication type (categorical: 'cellular','telephone', 'unknown')
+
+10. day: According to file documentation, this column is supposed to express the last contact day of the week, thus I would expect (since it's numeric) a range from 1 to 5 (monday to friday), while I see a range 1-31. I guess it represents the month's day.
+
+11. month: last contact month of year (categorical: 'jan', 'feb', 'mar', ..., 'nov', 'dec')
+
+12. duration: last contact duration, in seconds (numeric). Please noote that dataset documentation states that this attribute highly affects the output target e.g., if duration=0 then y='no'). Yet, the duration is not known before a call is performed. Also, after the end of the call y is obviously known. According to authors' documentation, this input should only be included for benchmark purposes and should be discarded if the intention is to have a realistic predictive model.
+
+13. campaign: number of contacts performed during this campaign and for this client (numeric, includes last contact)
+
+14. pdays: number of days that passed by after the client was last contacted from a previous campaign (numeric; -1 means client was not previously contacted). Note 1: this feature seems to include two pieces of information. The first: whether there was a previous campaign (documentation lead me to the conclusion that it's a single campaign). The second: in the case of a previous campaign, the time passed after last contact. Note 2: I guess a new feature should be created (previous campaign: "yes" or "no").
+
+15. previous: number of contacts performed before this campaign and for this client
+
+16. poutcome: outcome of the previous marketing campaign (categorical: 'failure','nonexistent', 'success')
+
+17. y (target variable): has the client subscribed a term deposit?
+
+It may be useful to make the difference between previous campaign and current campaign clear.
+
+Let's have a look to what follows.
+
+```{r}
+DataOrigin|>
+  group_by(pdays)|>
+  summarize(count=n())|>
+  mutate(perc=count/sum(count)*100)
+
+```
+
+The 81,7% of customers was not involved in any previous campaign.
+
+Then, specifically related to the remaining 18,3% it would be possible to do some
+
+binning in order to aggregate the number of days passed by after the client was last
+
+contacted from a previous campaign.
+
+```{r}
+summary(DataOrigin)
+```
+
+Campaign column has a min value of 1 and a max value of 63. 63 contacts during one single campaign seem really too many! The third quantile is 3. I want to understand how frequent 63: could it be a mistake in data gathering?
+
+Previous columns stands for the number of contacts performed before this campaign and for this client. With an average of 0.58 previous contact, max value is 275 contact.
+
+How can this be possible?
+
+Let's analyze campaign feature:
+
+```{r}
+DataCampaignCount <- DataOrigin|>
+  select(campaign)|>
+  group_by(campaign)|>
+  summarize(count=n())|>
+  arrange(desc(campaign))|>
+  mutate(countPerc=count/sum(count)*100,
+         cum=cumsum(count),
+         cumPerc=cum/sum(count)*100)
+```
+
+The relevance of number of contact bigger than 10 is pretty low. More than 97% of customers (1196 people) have been contacted 10 times or less during the campaign. All in all, I won't evaluate any transformation/elimination of this values.
+
+To sum up, the to-do list for the data preparation/feature engineering is composed of the following actions to undertake:
+
+1\. The following features are categorical or numerical with defined values; thus they are supposed to be processed as factors: job, marital , education, default, housing, loan, contact, day, month, poutcome, y.
+
+2\. The current name of the feature "campaing" (which contains the number of contacts performed during this campaign) must be indicated with a more evocative name (I will pick "contCurrCamp").
+
+3\. The current name of the feature "previous" (which contains the number of contacts performed BEFORE this campaign) must be indicated with a more evocative name (I will pick "contPrevCamp").
+
+4\. I want to create a brand new feature that returns if this is the first campaign ever addressed to the customer could be useful ("firstCamp" with possible cases: "Y" or "N"). I will check if the information it contains is useful to the project purposes, or if it turns out to be redundant due to an execess of correlation with the predictor from which it is originated.
+
+5\. pdays: it is used -1 value to say that no contact has been made. -1 is thus a sort of categorical variable in a numerical column. A transformation into a categorical variable via binning (after isolating values = -1) should be useful for future uses. A name like "distDaysPrevCamp" should be slightly more intuitive.
+
+6\. "duration" variable is not supposed to be considered for ML classification model's purposes.
+
+## 1.5. Feature engineering
+
+```{r}
+Data <- DataOrigin|>
+  mutate(job=as_factor(job),
+         marital=as_factor(marital) ,
+         education=as_factor(education),
+         default=as_factor(default),
+         housing=as_factor(housing),
+         loan=as_factor(loan),
+         contact=as_factor(contact),
+         day=as_factor(day),
+         month=as_factor(month),
+         poutcome=as_factor(poutcome),
+         y=as_factor(y),
+         firstCamp=as_factor(ifelse(pdays==-1, "Y", "N")),
+         distDaysPrevCamp=as_factor(case_when(pdays == -1 ~ "no prev campaign",
+                                    pdays >30 & pdays <=60 ~ "30-60 dd",
+                                    pdays >0 & pdays <=30 ~ "0-30 dd",
+                                    pdays >60 & pdays <=90 ~ "60-90 dd",
+                                    pdays > 90 ~ "over 90 dd")))|>
+  select(-duration, -pdays)|>
+  rename(contPrevCamp = previous,
+         contCurrCamp = campaign)
+```
+
+## 1.6. Data partitioning
+
+I'm now ready to split data set into train and test set. Of course, I want to keep the same proportion of target variable cases in both dataset, so I will use "strata" argument during the execution of initial_split() command.
+
+```{r}
+#| warning: false
+
+set.seed(987, sample.kind = "Rounding")
+
+DataSplit <- Data|>
+  initial_split(prop = 0.80,
+                strata = y)
+
+DataTrain <- training(DataSplit)
+
+DataTest <- testing(DataSplit)
+```
+
+I check whether the proportion of y cases are equal in train and test set as well as in the native dataset.
+
+```{r}
+prop.table(table(Data$y))
+prop.table(table(DataTrain$y))
+prop.table(table(DataTest$y))
+```
+
+Everything looks fine, so dataset setup is completed. Since now and during the following EDA and model training phases, I won't use the test set at all, in order to avoid data leakage.
+
+# 2. Explorative Data Analysis
+
+## 2.1. Target feature analysis
+
+First of all, it's worth recalling the frequencies of "yes" and "no" values which are assumed by the outcome variable "y".
+
+```{r}
+prop.table(table(DataTrain$y))
+```
+
+As already seen during previous data quality step target value is pretty unbalance: almost 90% of cases belongs to "no" class.
+
+## 2.2. Univariate analysis
+
+For the extent of this paragraph, I will deeply rely on the smartEDA package.
+
+### *2.2.1. Numerical features*
+
+Let's start with an overall summary of numerical features, after which I may want to get a closer look to single variable with graphics.
+
+```{r}
+DataTrain|>
+  ExpNumStat(by = "A",
+             gp = "y",
+             Qnt = c(0.25, 0.75),
+             Nlim = 2,
+             MesofShape = 2,
+             Outlier = TRUE,
+             round = 2)
+```
+
+Then, I want to detect possible outliers (for a better visualization I omit the sixth and the seventh row of the resulting dataframe which contain respectively every single lower and upper outlier cases).
+
+```{r}
+ExpOutliers(DataTrain,
+            varlist = c("age", "balance", "contCurrCamp", "contPrevCamp"),
+            method = "boxplot")$outlier_summary|>
+  slice(-6,-7)
+```
+
+Finally, I analyze numerical features distribution
+
+```{r}
+ExpNumViz(DataTrain,
+          target="y",
+          type=1,
+          Page=c(1,1))
+```
+
+As far as numerical predictors are concerned, no specific issue seem to arise: outliers are definitely in there, but they appear to be considered acceptable and representative.
+
+### *2.2.2. Categorical features*
+
+Again, I'll start with a summary of categorical features.
+
+```{r}
+#| warning: false
+DataTrain|>
+  ExpCatStat(Target = "y",
+             result = "Stat",
+             clim=15,
+             nlim=5,
+             bins=10,
+             Pclass="yes",
+             plot=FALSE,
+             top=20,
+             Round=2)
+```
+
+Then, I move on to look at their distribution.
+
+```{r}
+ExpCatViz(data=DataTrain,
+          target="y",
+          Page=c(1,1),
+          Flip=TRUE,
+          col=c("blue", "violet"))
+```
+
+The relation between y (target variable) and other single categorical variables may be described as follows:
+
+-   generally, speaking there's an overall low-level of association.
+
+-   poutcome is the only predictor that show a somewhat relevant association with target variable (Cramer's V equal to 0.32).
+
+## 2.3. Multivariate analysis
+
+### *2.3.1 Correlation between numerical predictors*
+
+```{r}
+EdaCorMatr <- round(cor(DataTrain[,c(1,6,12,13)], use="complete.obs"), 1)
+
+ggcorrplot(EdaCorMatr,
+           hc.order = TRUE,
+           type = "lower",
+           lab = TRUE)
+```
+
+This analysis is probably quite poor with four numerical features. In any case, no correlation seems to exist between the variables taken into account.
+
+### *2.3.2. Association between categorical predictors*
+
+In order to analysize the association existing between every couple of features, I'm going to use Cramer's V and to apply this function to every pair of variables using the PairApply() command from the DescTools package.
+
+```{r}
+EdaAssMatr <- DataTrain|>
+  select(-age,
+         -balance,
+         -contCurrCamp,
+         -contPrevCamp)|>
+  PairApply(FUN=CramerV,
+            symmetric=TRUE)|>
+  round(digits = 1)
+```
+
+The result is a matrix that can be effectively exposed as correlation plot using the ggcorrplot() command.
+
+```{r}
+ggcorrplot(EdaAssMatr,
+           hc.order = TRUE,
+           type = "lower",
+           lab = TRUE,
+           lab_size = 2)
+```
+
+What comes from this plot?
+
+1.  "poutcome" and "firstCamp" are highly associated. That was quite easy to predict: the outcome of previous campaign is "unknown" as long as this is the first campaign. Since, according to Cramer's V, poutcome is more associated to target variable than firstCamp, I would pick the first.
+
+2.  Identically, the same thing happens between distDaysPrevCamp (distance in days from the previous campaign) and first campaign. Again: when this is the first campaign the distance in days from the previous campaign gets the categorical value "no previous campaign". Since, according to Cramer's V, distDaysPrevCamp is slightly more associated to y (the target variable) than firstCamp, I would pick the first.
+
+## 2.4. Notes for further steps
+
+1.  The target variable is pretty unbalanced. This fact suggests an under/oversampling in the preprocessing step of the machine learning project phase.
+2.  The "firstCamp" feature that was not included in the original dataset and was created later, is probably useless because too correlated with other existing predictors.
+3.  Quite a lot of features seem to be slightly correlated with target variable. It could be wise to experiment a model (like decision tree) able to feed back a feature importance ranking.
+
+# 3. ML model: decision tree
+
+I have imported the dataset, cleaned and manipulated it; I have analysed numerical and categorical predictors in order to have a better knowledge of the "raw material" I'm about to use to train a ML model.
+
+Due to the weak to medium correlation between every predictor and outcome, I will pick decision tree model: a simple option that will allow me to get feature importance which I am particularly interested in, especially after EDA's feedback.
+
+The first thing is to create the baseline for any comparison, which is a decision tree whose hyperparameters will be tuned and that does not take any care of unbalanced data.
+
+Next, I want to see if and how the choice of rebalancing target values proportion will bring some benefits.
+
+In order to make a fair comparison, hyperparameter tuning will be carried on in the same way also for the training/testing phases on rebalanced dataset (both via undersampling and via oversampling). To keep things simple, optimize laptop resources and grant some readability of the model, I have defined a range of hyperparameters to choose that will be used for every following training session:
+
+-   cost_complexity from (-5) to (-3),
+
+-   tree_depth from 5 to 7.
+
+Thus, I will tune three decision tree:
+
+1.  the first, without under/oversampling, with hyperparameters tuning,
+
+2.  the second which includes rebalancing via undersampling
+
+3.  the third which uses oversampling to solve unbalanced target values.
+
+As stated before, my very first goal is not picking the most performing model at all, but understanding if and how both undersampling and oversampling affect the final result of a specific model, taking into account the ratio between the two possible classes of the target variable (in this project: "yes" or "no").
+
+Thus, during under/oversampling, I will use a reiterate training and testing with different "yes/no" ratio in order to find out which ratio will produce more benefit. In details, I will use themis package which is specifically aimed to deal with unbalanced data.
+
+## 3.1. Tuned decision tree without under/oversampling
+
+### *3.1.1 Training and testing*
+
+I start by setting the preprocessing recipe.
+
+```{r}
+dtRecipe <- DataTrain |>
+  recipe(y ~.)|>
+  step_rm(c("firstCamp"))
+```
+
+I select the model I'm interested to use (as said, decision tree) with hyperparameters tuning options.
+
+```{r}
+dtTuneModel <- decision_tree(tree_depth = tune(),
+                         cost_complexity = tune())|>
+  set_engine("rpart")|>
+  set_mode("classification")
+```
+
+I define:
+
+1.  tuning grid. I need to keep it simple to optimize my laptop computational resources. I will thus set 3 levels only (which means nine combination of the two hyperparameters).
+
+2.  cross validation folds. Again, I'm going to use 5 folds which is probably the lowest useful number of folds to make cross validation useful.
+
+3.  metric set. In order to evaluate performance, I will create an object (called "dtMultiMetric") composed of different index (accuracy, kappa, balanced accuracy, specificity, sentitivity and f-measure) for an overall evaluation; specifically I will pay particular attention to balanced accuracy which, in my opinion, should give fair relevance to both the need for catching true positive and of true negative predictions.
+
+```{r}
+dtTuneGrid <- grid_regular(cost_complexity(c(-5, -3)),
+                           tree_depth(c(5,7)),
+                           levels = 3)
+```
+
+```{r}
+#| warning: false
+set.seed(123, sample.kind = "Rounding")
+dtTuneFold <- vfold_cv(DataTrain, v=5)
+
+# set multi metrics
+multi_metric <- metric_set(accuracy,
+                          kap,
+                          bal_accuracy,
+                          spec,
+                          sens,
+                          f_meas)
+```
+
+I create the workflow creation, choose the best hyperparameters (here based on specificity metric), fit the model and plot it.
+
+```{r}
+dtTuneWorkflow <- workflow()|>
+  add_recipe(dtRecipe)|>
+  add_model(dtTuneModel)
+
+dtTuneFit <- dtTuneWorkflow|>
+  tune_grid(resamples = dtTuneFold,
+            grid = dtTuneGrid,
+            metrics = multi_metric)
+
+# best hyperparameters selection
+dtTunebest <- dtTuneFit|>
+  select_best(metric="bal_accuracy")
+
+# finalize
+dtTuneWorkflowFinal <- dtTuneWorkflow|> 
+  finalize_workflow(dtTunebest)
+
+dtTuneFinal <- dtTuneWorkflowFinal|>
+  fit(DataTrain)
+
+```
+
+### *3.1.2. Main results*
+
+The tuned tree takes the following shape
+
+```{r}
+#| warning: false
+# tree plot
+dtTuneFinal|>
+  extract_fit_engine()|> 
+  rpart.plot(roundint = FALSE, cex=0.5)
+```
+
+shows these tuned hyperparameters
+
+```{r}
+# tuning hyperparameters
+kable(dtTunebest[1,1:2])
+```
+
+performs according to these metrics
+
+```{r}
+# metric
+dtMultiMetrics <- dtTuneFinal|>
+  predict(DataTest)|>
+  bind_cols(DataTest) |>
+  multi_metric(truth = y, estimate = .pred_class)
+
+dtMultiMetrics|>
+  select(-.estimator)|>
+  kable()
+```
+
+and reports this feature importance.
+
+```{r}
+# feature importance plot
+dtTuneFinal %>% 
+  extract_fit_parsnip()|> 
+  vip()
+```
+
+## 3.2. Tuned decision tree with undersampling
+
+### *3.2.1. Training and testing*
+
+There is no need to create a model. I want to use the same model used previously (dtTuneModel).
+
+The same goes for the tuning grid, the cross validation folds and the metric set: I've previously created dtTuneGrid, dtTuneFold and multi_metrics. They'll fit the bill.
+
+Here it comes the crucial point.
+
+I am interested in how the undersampling (and in the following step the oversampling) techique performs with different value of the argument called "under ratio" which is the ratio of the minority-to-majority frequencies (for example, a value of 2 would mean that the majority levels will have approximately twice as many rows than the minority level).
+
+I want to reiterate the training cycle (preprocessing, hyperparameters tuning, and testing) with five different "under ratio" values to see which one returns the best performance of the tuned decision tree model.
+
+```{r}
+under_ratios <- c(0.5, 0.75, 1, 1.25, 1.5)
+```
+
+```{r}
+dtUnderModFun <- function(under_ratios){
+  
+ dtRecipe <- DataTrain|>
+    recipe(y ~ .)|>
+    step_rm(c("firstCamp"))|>
+    step_downsample(y, under_ratio = under_ratios, seed=523)
+  
+  dtWorkflow <- workflow()|>
+    add_recipe(dtRecipe)|>
+    add_model(dtTuneModel)
+  
+  dtFit <- dtWorkflow|>
+    tune_grid(resamples = dtTuneFold,
+              grid = dtTuneGrid,
+              metrics = multi_metric)
+  
+  dtUnderTunebest <- dtFit|>
+    select_best(metric="bal_accuracy")
+  
+  assign("dtUnderTunebestFun", dtUnderTunebest, envir = .GlobalEnv)
+  
+  dtTuneWorkflowFinal <- 
+    dtWorkflow|> 
+    finalize_workflow(dtUnderTunebest)
+  
+  dtTuneFinal <- dtTuneWorkflowFinal|>
+    fit(DataTrain)
+  
+  dtMultiMetrics <- dtTuneFinal|>
+    predict(DataTest)|>
+    bind_cols(DataTest) |>
+    multi_metric(truth = y, estimate = .pred_class)
+  
+  dtMultiMetrics[[3,3]]
+}
+```
+
+After setting the seed, I reiterate the function I've created to keep all the necessary steps in a whole with map function from purr package.
+
+```{r}
+#| warning: false
+set.seed(523, sample.kind = "Rounding")
+
+dtUnderPar<- map_dbl(.x = under_ratios,
+                     .f = dtUnderModFun)
+
+dtUnderSampling <- bind_cols(ratio=under_ratios, bal_acc_under=dtUnderPar)
+
+dtUnderSampling|>
+  arrange(desc(bal_acc_under))|>
+  kable()
+```
+
+The optimal ratio for undersampling is 1.00. Let's use it to extract the final tree with undersampled data base.
+
+### *3.2.2. Main results*
+
+The tuned tree takes the following shape
+
+```{r}
+#| echo: false
+#| warning: false
+# Preprocessing recipe
+
+dtUnderRecipe <- DataTrain |>
+  recipe(y ~.)|>
+  step_rm(c("firstCamp"))|>
+  step_downsample(y, under_ratio = 1, seed=523)
+
+
+# Model selection with hyperparameters tuning
+
+dtModel <- decision_tree(tree_depth = tune(),
+                         cost_complexity = tune())|>
+  set_engine("rpart")|>
+  set_mode("classification")
+
+
+# tuning grid
+dtTuneGrid <- grid_regular(cost_complexity(c(-5,-3)),
+                           tree_depth(c(5, 7)),   
+                           levels = 3)
+
+# cross validation folds
+set.seed(123, sample.kind = "Rounding")
+dtTuneFold <- vfold_cv(DataTrain, v=5)
+
+
+# Workflow creation, fitting and model plotting
+
+dtUnderWorkflow <- workflow()|>
+  add_recipe(dtUnderRecipe)|>
+  add_model(dtModel)
+
+dtUnderFit <- dtUnderWorkflow|>
+  tune_grid(resamples = dtTuneFold,
+            grid = dtTuneGrid,
+            metrics = multi_metric)
+
+
+# best hyperparameters
+dtUnderTunebest <- dtUnderFit|>
+  select_best(metric="bal_accuracy")
+
+
+# finalize
+dtUnderTuneWorkflowFinal <- 
+  dtUnderWorkflow|> 
+  finalize_workflow(dtUnderTunebest)
+
+dtUnderTuneFinal <- dtUnderTuneWorkflowFinal|>
+  fit(DataTrain)
+
+```
+
+```{r}
+# tree plot
+
+dtUnderTuneFinal|>
+  extract_fit_engine()|>
+  rpart.plot(roundint = FALSE, cex=0.5)
+```
+
+shows these tuned hyperparameters
+
+```{r}
+kable(dtUnderTunebest[1,1:2])
+```
+
+performs according to these metrics. Note that I don't want to apply preprocessing recipe on test dataset, thus I will use extract_fit_parsnip() command to obtain the parsnip model specification in order to use it without any preprocessing step.
+
+```{r}
+# prediction and evaluation
+
+# Extract the fitted model
+dtUnderFittedModel <- dtUnderTuneFinal|>
+  extract_fit_parsnip()
+
+# Make predictions without preprocessing
+dtUnderMultiMetricsNoPrep <- dtUnderFittedModel|>
+  predict(DataTest)|>
+  bind_cols(DataTest) |>
+  multi_metric(truth = y, estimate = .pred_class)|>
+  select(-.estimator)|>
+  kable()
+
+dtUnderMultiMetricsNoPrep
+```
+
+and reports this feature importance.
+
+```{r}
+# variable importance
+
+dtUnderTuneFinal %>% 
+  extract_fit_parsnip()|> 
+  vip()
+```
+
+## 3.3. Tuned decision tree with oversampling
+
+### *3.3.1. Training and testing*
+
+As for undersampling, I'll keep on using what has been previously created: the model "dtTuneModel", the tuning grid "dtTuneFold", the cross validation folds "dtTuneFold" and the metric set "multi_metrics".
+
+What I need to do is to modify is the function that holds inside the oversampling preprocessing step and which is feed with "over ratio" arguments.
+
+```{r}
+over_ratios <- c(0.5, 0.75, 1, 1.25, 1.5)
+
+
+dtOverModFun <- function(over_ratios){
+  
+  dtRecipe <- DataTrain|>
+    recipe(y ~ .)|>
+    step_rm(c("firstCamp"))|>
+    step_upsample(y, over_ratio = over_ratios, seed=523)
+  
+  dtWorkflow <- workflow()|>
+    add_recipe(dtRecipe)|>
+    add_model(dtTuneModel)
+  
+  dtFit <- dtWorkflow|>
+    tune_grid(resamples = dtTuneFold,
+              grid = dtTuneGrid,
+              metrics = multi_metric)
+  
+  dtOverTunebest <- dtFit|>
+    select_best(metric="bal_accuracy")
+  
+  assign("dtOverTunebestFun", dtUnderTunebest, envir = .GlobalEnv)
+  
+  dtTuneWorkflowFinal <- 
+    dtWorkflow|> 
+    finalize_workflow(dtOverTunebest)
+  
+  dtTuneFinal <- dtTuneWorkflowFinal|>
+    fit(DataTrain)
+  
+  dtMultiMetrics <- dtTuneFinal|>
+    predict(DataTest)|>
+    bind_cols(DataTest) |>
+    multi_metric(truth = y, estimate = .pred_class)
+  
+  dtMultiMetrics[[3,3]]
+}
+```
+
+Time for applying the function and check results.
+
+```{r}
+#| warning: false
+set.seed(523, sample.kind = "Rounding")
+
+dtOverPar<- map_dbl(.x = over_ratios,
+                    .f = dtOverModFun)
+
+dtOverSampling <- bind_cols(ratio=over_ratios, bal_acc_over=dtOverPar)
+
+dtOverSampling|>
+  arrange(desc(bal_acc_over))|>
+  kable()
+```
+
+### *3.3.2. Main results*
+
+The tuned tree takes the following shape
+
+```{r}
+#| echo: false
+#| warning: false
+# Preprocessing recipe
+
+dtOverRecipe <- DataTrain |>
+  recipe(y ~.)|>
+  step_rm(c("firstCamp"))|>
+  step_upsample(y, over_ratio = 1.5, seed=523)
+
+
+# Model selection with hyperparameters tuning
+
+dtModel <- decision_tree(tree_depth = tune(),
+                         cost_complexity = tune())|>
+  set_engine("rpart")|>
+  set_mode("classification")
+
+
+# tuning grid
+dtTuneGrid <- grid_regular(cost_complexity(c(-5, -3)),
+                           tree_depth(c(5,7)),     
+                           levels = 3)
+
+# cross validation folds
+set.seed(123, sample.kind = "Rounding")
+dtTuneFold <- vfold_cv(DataTrain, v=5)
+
+
+# Workflow creation, fitting and model plotting
+
+dtOverWorkflow <- workflow()|>
+  add_recipe(dtOverRecipe)|>
+  add_model(dtModel)
+
+dtOverFit <- dtOverWorkflow|>
+  tune_grid(resamples = dtTuneFold,
+            grid = dtTuneGrid,
+            metrics = multi_metric)
+
+# best hyperparameters
+dtOverTunebest <- dtOverFit|>
+  select_best(metric="bal_accuracy")
+
+
+# finalize
+dtOverTuneWorkflowFinal <- 
+  dtOverWorkflow|> 
+  finalize_workflow(dtOverTunebest)
+
+dtOverTuneFinal <- dtOverTuneWorkflowFinal|>
+  fit(DataTrain)
+
+```
+
+```{r}
+# tree plot
+
+dtOverTuneFinal|>
+  extract_fit_engine()|>
+  rpart.plot(roundint = FALSE, cex=0.5)
+```
+
+shows these tuned hyperparameters
+
+```{r}
+kable(dtOverTunebest[1,1:2])
+```
+
+performs according to these metrics. Again, note that I'll just use the model wihout any preprocessing recipe.
+
+```{r}
+# prediction and evaluation
+
+# Extract the fitted model
+dtOverFittedModel <- dtOverTuneFinal|>
+  extract_fit_parsnip()
+
+# Make predictions without preprocessing
+dtOverMultiMetricsNoPrep <- dtOverFittedModel|>
+  predict(DataTest)|>
+  bind_cols(DataTest) |>
+  multi_metric(truth = y, estimate = .pred_class)|>
+  select(-.estimator)|>
+  kable()
+
+dtOverMultiMetricsNoPrep
+```
+
+and reports this feature importance.
+
+```{r}
+# variable importance
+
+dtOverTuneFinal %>% 
+  extract_fit_parsnip()|> 
+  vip()
+```
+
+## 3.4. Which option performed better?
+
+Let's try to put everything together and understand what is the best option in order to get the best model performance (in terms of balanced accuracy).
+
+```{r}
+ggplot()+ 
+  geom_line(data = dtUnderSampling,
+            aes(x = ratio, y = bal_acc_under, colour = 'undersampling')) + 
+  geom_text(data = dtUnderSampling,
+            aes(x = ratio, y = bal_acc_under, label = round(bal_acc_under, digits=4)),
+            size = 3)+
+  geom_line(data = dtOverSampling,
+            aes(x = ratio, y = bal_acc_over, colour = 'oversampling')) +
+  geom_text(data = dtOverSampling,
+            aes(x = ratio, y = bal_acc_over, label = round(bal_acc_over, digits=4)),
+            size = 3)+
+  geom_hline(aes(yintercept = 0.5712028, linetype = "no under/oversampling"), colour="purple")+
+  scale_y_continuous(limits=c(0.55, 0.75))+
+  labs(x = "sampling ratio",
+       y = "balanced accuracy",
+       title = "Best performing under/over sampling ratio") +
+  theme_bw()+
+  theme(legend.title = element_blank()) 
+```
+
+The plot clearly show the significant effect of both under and over sampling on the model's performance.
+
+# 4. Conclusions
+
+## About the model
+
+-   Rebalancing the training set pays off: without under/over sampling I have reached an about 0.57 balanced accuracy which has rocketed to about 0.70 after rebalancing.
+
+-   Other differences between training the model either on the original (unbalanced) or on a rebalanced dataset are:
+
+-   *feature importance changes. Specifically the first four variable are always the same (poutcome, month, day and contact), but their relavance (ranking) changes. Month is the most important variable to explain the model trained on an under/oversampled dataset, while poutcome is by far the most important when using the original dataset.*
+
+-   *tree depth changes: when working on the original dataset, the tree has 5 levels. After either under or over sampling, levels increase to 7. Please note that in the tune grid I set a range from 5 to 7, otherwise, the tree would have turned to be very deep, or long, and thus unreadable.*
+
+-   *cost complexity hasn't changed at all. In the range I've set in the tune grid (0.001 - 0.00001), 0.001 has always been returned.*
+
+-   Generally speaking, even the best performance does not seem very satisfying. A balanced accuracy of around 70% that may be acceptable (it's far better than tossing!), but mantains some room for uncertainty.
+
+-   Specific ranges have been set in the tuning grid in order to speed up the whole process and ensure model's readability.
+
+## About under vs over sampling
+
+-   Undersampling based decision tree has got its best result with a 1 minority-to majority ratio: 0.7141.
+
+-   Oversampling based decision tree "scored" a 0.717 balanced accuracy with, again, a 1.50 minority-to majority ratio.
+
+-   As said before, it is clearly important to fix the unbalanced target value issue in order to improve performance dramatically; it's definitely less important whether to follow undersampling or oversampling approach. The latter has led to a slightly better result which, in turn, has asked for more computation effort due to the increased dimension of the rebalanced dataset.
+
+## Lessons learned
+
+1.  It is useful to define *ex ante* tuning grid parameters to keep the process fast and "under control".
+
+2.  Chose a metric and stick to it throughout the whole project in order to ensure results comparability.
+
+3.  Set specific value ranges in the tuning grid (cp and tree depth) in order to speed up the whole process and ensure model's readability.
+
+4.  Test undersampling and oversampling with a pretty wide range of ratios in order to see which one brings to the best result: map function from purrr package has been very helpful in this stage.
+
+5.  Pay attention to set the seeds every time a sampling is made in order to ensure reproducibility.
+
+6.  When testing the model, after training, I have used the fitted model without preprocessing, in order to simulate a "real world" data to treat. But what if I had used the same whole workflow used for the training phase? I've separately (and not reported here) tried this solution and got the same exact metrics; I've done some other quick trial with both other dataset and other models and I've come to conclusion that while decision tree is totally insensitive to test preprocessing, other models (i.e. knn) bring to different performance if the test set is preprocessed or not (as expeted, in case of preprocessing metrics are higher, thus probably deceptive).
+
+# References
+
+Moro,S., Rita,P., and Cortez,P.. (2012). Bank Marketing. UCI Machine Learning Repository. <https://doi.org/10.24432/C5K306.>
